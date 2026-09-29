@@ -12,7 +12,7 @@
  *      ID-addressabile (~/.pi/arc/archive/<id>.json).
  *   2. Nel contesto attivo, il tool output viene sostituito da
  *      una citazione compatta: "[ARC id=<id> tokens=<n> summary=<...>]"
- *   3. L'agente puo' richiedere il contenuto originale via
+ *   3. The agent can request the original content via
  *      tool arc_recall(id) senza ri-eseguire il tool.
  *   4. Separazione netta: archivio (completo) vs contesto attivo (compresso).
  *
@@ -79,6 +79,76 @@ const DEFAULT_CONFIG: ArcConfig = {
   showWidget: true,
   debug: false,
 };
+
+// ---------------------------------------------------------------------------
+// i18n
+// ---------------------------------------------------------------------------
+
+type Lang = 'en' | 'it';
+
+const FALLBACK: Lang = 'en';
+
+function primaryOf(tag: string): string | null {
+  if (typeof tag !== 'string') return null;
+  // Same regex as pi-anti-amnesia/i18n.mjs, pi-cwl and pi-cron-bg: a naive
+  // split on "." yields "it_it" for "it_IT.UTF-8", which is not supported.
+  const m = /^\s*([A-Za-z]{2,3})(?:-|_)/.exec(tag) ?? /^\s*([A-Za-z]{2,3})\s*$/.exec(tag);
+  return m ? m[1].toLowerCase() : null;
+}
+
+function isSupported(primary: string | null): primary is Lang {
+  return primary === 'en' || primary === 'it';
+}
+
+/**
+ * Resolves the system language once, at module load.
+ * Must stay in lockstep with the other extensions: they all inject
+ * instructions into the same model context, and mixed-language directives
+ * degrade the model.
+ */
+function detectLang(): Lang {
+  const env = process.env;
+  for (const name of ['LC_ALL', 'LC_MESSAGES', 'LANG', 'LANGUAGE']) {
+    const tag = env?.[name];
+    if (!tag || tag === 'C' || tag === 'POSIX') continue;
+    const primary = primaryOf(tag);
+    if (isSupported(primary)) return primary;
+  }
+  try {
+    const icu = primaryOf(Intl.DateTimeFormat().resolvedOptions().locale ?? '');
+    if (isSupported(icu)) return icu;
+  } catch { /* no ICU data */ }
+  return FALLBACK;
+}
+
+const LANG: Lang = detectLang();
+
+type ArcMessages = {
+  entryNotFound: (id: string) => string;
+  recallTruncated: string;
+  purgeDone: (purged: number, days: number) => string;
+  purgeNothing: string;
+};
+
+const I18N: Record<Lang, ArcMessages> = {
+  en: {
+    entryNotFound: (id) => `ARC entry "${id}" not found in the archive.`,
+    recallTruncated: '… (truncated, use full=true for the complete content)',
+    purgeDone: (purged, days) => `ARC purge: removed ${purged} entries older than ${days}d.`,
+    purgeNothing: 'No orphan entry to remove.',
+  },
+  it: {
+    entryNotFound: (id) => `Entry ARC "${id}" non trovato nell'archivio.`,
+    recallTruncated: '… (troncato, usa full=true per il contenuto completo)',
+    purgeDone: (purged, days) => `ARC purge: rimosse ${purged} entry piu' vecchie di ${days}gg.`,
+    purgeNothing: 'Nessun job orfano da rimuovere.',
+  },
+} satisfies Record<Lang, ArcMessages>;
+
+/** Localised string for the active language. */
+function t<K extends keyof ArcMessages>(key: K): ArcMessages[K] {
+  return I18N[LANG][key];
+}
 
 const CONFIG_PATH = path.join(os.homedir(), '.pi', 'arc', 'config.json');
 const ARCHIVE_DIR = path.join(os.homedir(), '.pi', 'arc', 'archive');
@@ -191,7 +261,7 @@ function invalidateListCache() {
 }
 
 // ---------------------------------------------------------------------------
-// Session state (per-sessione: evita collisioni tra subagent)
+// Session state (per session: avoids collisions with subagents)
 // ---------------------------------------------------------------------------
 
 interface ArcState {
@@ -320,7 +390,7 @@ function transformContext(
 
     const h = contentHash(fullText);
 
-    // FIX #3: de-dup — se gia' trasformato, inserisci la CITAZIONE, non il contenuto originale
+    // FIX #3: de-dup — already transformed, emit the CITATION, not the original content
     if (state.transformedHashes.has(h)) {
       const existingId = state.hashToId.get(h);
       if (existingId) {
@@ -441,7 +511,7 @@ export default function (pi: ExtensionAPI) {
       const entry = loadEntry(params.id);
       if (!entry) {
         return {
-          content: [{ type: 'text', text: `Entry ARC "${params.id}" non trovato nell'archivio.` }],
+          content: [{ type: 'text', text: t('entryNotFound')(params.id) }],
           details: { ok: false, error: 'entry-not-found' },
         };
       }
@@ -449,7 +519,7 @@ export default function (pi: ExtensionAPI) {
       // FIX #4: onora il parametro 'full'
       const full = params.full ?? true;
       const preview = full ? entry.content : entry.content.slice(0, 500);
-      const truncated = full ? '' : (entry.content.length > 500 ? '… (troncato, usa full=true per il completo)' : '');
+      const truncated = full ? '' : (entry.content.length > 500 ? t('recallTruncated') : '');
 
       return {
         content: [{ type: 'text', text: `ARC ${entry.id} [${entry.toolName}, ${entry.tokenEstimate} tokens]:\n${preview}${truncated}` }],
@@ -495,10 +565,10 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: 'arc_purge',
     label: 'ARC Purge',
-    description: "Pulisce entry archiviate piu' vecchie di N giorni. NON tocca il contesto attivo.",
+    description: 'Purges archived entries older than N days. Does NOT touch the active context.',
     promptSnippet: 'arc_purge: pulisci archivio ARC vecchio',
     parameters: Type.Object({
-      daysOlder: Type.Optional(Type.Number({ description: "Rimuovi entry piu' vecchie di N giorni (default 30)." })),
+      daysOlder: Type.Optional(Type.Number({ description: 'Remove entries older than N days (default 30).' })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const key = sessionKey(ctx);
@@ -512,7 +582,7 @@ export default function (pi: ExtensionAPI) {
         if (e.timestamp < cutoff && !st.activeCitations.has(e.id)) {
           try {
             fs.unlinkSync(path.join(ARCHIVE_DIR, `${e.id}.json`));
-            // Rimuovi anche dall'indice hashToId della sessione corrente
+            // Also drop it from the current session's hashToId index
             st.hashToId.delete(e.contentHash);
             st.activeCitations.delete(e.id);
             st.transformedHashes.delete(e.contentHash);
@@ -522,7 +592,7 @@ export default function (pi: ExtensionAPI) {
       }
       invalidateListCache();
       return {
-        content: [{ type: 'text', text: `ARC purge: rimosse ${purged} entry piu' vecchie di ${days}gg.` }],
+        content: [{ type: 'text', text: t('purgeDone')(purged, days) }],
         details: { ok: true, purged, days },
       };
     },
@@ -544,7 +614,7 @@ export default function (pi: ExtensionAPI) {
 
     if (!event.messages || event.messages.length === 0) return;
 
-    // Stima token totali del contesto
+    // Estimate the total context tokens
     const totalTokens = event.messages.reduce((sum, m) => {
       try { return sum + estimateTokens(JSON.stringify(m)); } catch { return sum; }
     }, 0);
