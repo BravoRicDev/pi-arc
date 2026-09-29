@@ -32,6 +32,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 
 // ---------------------------------------------------------------------------
 // Tipi minimi della forma reale dei messaggi (sottoset di @earendil-works/pi-ai)
@@ -50,6 +51,8 @@ interface RealMessage {
   toolCallId?: string;
   toolName?: string;
   timestamp?: number;
+  /** Id of the archive entry this message's content was replaced by. */
+  _arcId?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -65,6 +68,12 @@ interface ArcConfig {
   maxArchiveEntryBytes: number;
   /** Tool output piu' piccolo di questo non viene archiviato (bytes). */
   minArchiveBytes: number;
+  /**
+   * Tetto sul TOTALE dell'archivio. L'archivio e' append-only e la purge e'
+   * solo per eta' e manuale: senza questo, un'installazione a lungo termine
+   * accumula GB (ogni entry puo' arrivare a maxArchiveEntryBytes).
+   */
+  maxArchiveTotalBytes: number;
   /** Mostra widget UI. */
   showWidget: boolean;
   /** Log di debug. */
@@ -76,6 +85,7 @@ const DEFAULT_CONFIG: ArcConfig = {
   thresholdRatio: 0.85,
   maxArchiveEntryBytes: 500_000,
   minArchiveBytes: 5_000,
+  maxArchiveTotalBytes: 200_000_000, // ~200 MB
   showWidget: true,
   debug: false,
 };
@@ -150,17 +160,25 @@ function t<K extends keyof ArcMessages>(key: K): ArcMessages[K] {
   return I18N[LANG][key];
 }
 
+// Config utente: ~/.pi/arc/config.json. Se assente si cade sul config incluso
+// nell'estensione, cosi' il file distribuito col repo serve davvero a qualcosa
+// invece di restare un documento morto.
+const _EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = path.join(os.homedir(), '.pi', 'arc', 'config.json');
+const BUNDLED_CONFIG_PATH = path.join(_EXT_DIR, 'config.json');
 const ARCHIVE_DIR = path.join(os.homedir(), '.pi', 'arc', 'archive');
 const LOG_PATH = path.join(os.homedir(), '.pi', 'arc', 'arc.log');
 
 function loadConfig(): ArcConfig {
-  try {
-    const raw = fs.readFileSync(CONFIG_PATH, 'utf8');
-    return { ...DEFAULT_CONFIG, ...JSON.parse(raw) };
-  } catch {
-    return { ...DEFAULT_CONFIG };
+  for (const candidate of [CONFIG_PATH, BUNDLED_CONFIG_PATH]) {
+    try {
+      const raw = fs.readFileSync(candidate, 'utf8');
+      return { ...DEFAULT_CONFIG, ...JSON.parse(raw) as Partial<ArcConfig> };
+    } catch {
+      // prova il candidato successivo
+    }
   }
+  return { ...DEFAULT_CONFIG };
 }
 
 function debugLog(cfg: ArcConfig, msg: string) {
@@ -215,6 +233,13 @@ function storeEntry(entry: ArchiveEntry): string {
   // Write to temp file first, then atomic rename.
   fs.writeFileSync(tmpPath, JSON.stringify(entry));
   fs.renameSync(tmpPath, finalPath);
+  // Keep the derived caches coherent. Without this, diskIndex() keeps serving
+  // the snapshot it took before this write, so the next session (whose in-memory
+  // hashToId starts empty) misses the entry and archives a duplicate.
+  _listCache = null;
+  if (_diskIndex) {
+    if (!_diskIndex.has(entry.contentHash)) _diskIndex.set(entry.contentHash, entry.id);
+  }
   return entry.id;
 }
 
@@ -258,6 +283,63 @@ function listEntries(): ArchiveEntry[] {
 
 function invalidateListCache() {
   _listCache = null;
+  _diskIndex = null;
+}
+
+/**
+ * Keeps the archive under cfg.maxArchiveTotalBytes by dropping the OLDEST
+ * entries first. Entries cited in the active context are never removed: that
+ * would break arc_recall on a citation the model is still looking at.
+ *
+ * Runs after a store, so the newly written entry is the newest and therefore
+ * the last candidate for eviction.
+ */
+function enforceArchiveCap(cfg: ArcConfig, state: ArcState): number {
+  const entries = listEntries();
+  let total = 0;
+  for (const e of entries) total += (e?.sizeBytes ?? 0);
+  if (total <= cfg.maxArchiveTotalBytes) return 0;
+
+  const byAge = [...entries].sort((a, b) => (a?.timestamp ?? 0) - (b?.timestamp ?? 0));
+  let removed = 0;
+  for (const e of byAge) {
+    if (total <= cfg.maxArchiveTotalBytes) break;
+    if (!e || state.activeCitations.has(e.id)) continue;
+    try {
+      fs.unlinkSync(path.join(ARCHIVE_DIR, `${e.id}.json`));
+      total -= (e.sizeBytes ?? 0);
+      state.hashToId.delete(e.contentHash);
+      state.transformedHashes.delete(e.contentHash);
+      removed++;
+    } catch { /* ignore: another process may have removed it first */ }
+  }
+  if (removed > 0) invalidateListCache();
+  return removed;
+}
+
+// ---------------------------------------------------------------------------
+// Disk index (contentHash -> id)
+//
+// The per-session hashToId Map starts empty on every session_start, so without
+// this a tool output already archived by an earlier session would be stored a
+// second time under a fresh id. Re-reading the same file is routine, which
+// makes archive duplication the normal case rather than an edge case.
+// Built lazily on first miss, cached until the archive directory changes.
+// ---------------------------------------------------------------------------
+
+let _diskIndex: Map<string, string> | null = null;
+
+function diskIndex(): Map<string, string> {
+  if (_diskIndex) return _diskIndex;
+  const idx = new Map<string, string>();
+  for (const e of listEntries()) {
+    if (e && typeof e.contentHash === 'string' && e.id) {
+      // First writer wins: the oldest id stays canonical.
+      if (!idx.has(e.contentHash)) idx.set(e.contentHash, e.id);
+    }
+  }
+  _diskIndex = idx;
+  return idx;
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +435,21 @@ function transformContext(
   const citations: string[] = [];
   const transformed: AgentMessage[] = [];
 
+  // Refresh activeCitations against the context we are actually looking at.
+  // It used to be append-only, so every entry ever archived stayed "active"
+  // and enforceArchiveCap() could never evict anything: the cap was inert.
+  // Citations only live as long as the message carrying them, so prune here.
+  const liveIds = new Set<string>();
+  for (const m of messages) {
+    const r = (m as unknown as RealMessage);
+    if (r && r._arcId) liveIds.add(r._arcId);
+  }
+  if (liveIds.size > 0 || state.activeCitations.size > 0) {
+    for (const id of [...state.activeCitations.keys()]) {
+      if (!liveIds.has(id)) state.activeCitations.delete(id);
+    }
+  }
+
   for (const msg of messages) {
     const m = msg as unknown as RealMessage;
 
@@ -375,72 +472,37 @@ function transformContext(
       .map(b => b.text ?? b.data ?? '')
       .join('\n');
 
-    if (fullText.length < cfg.minArchiveBytes) {
+    // Content is measured in bytes, not UTF-16 code units: an Italian or
+    // emoji-heavy tool output is up to 3-4x larger than .length suggests, so
+    // comparing .length against a "*Bytes" threshold let oversized payloads
+    // through. Measure once, reuse for both limits.
+    const sizeBytes = new TextEncoder().encode(fullText).length;
+    if (sizeBytes < cfg.minArchiveBytes) {
       transformed.push(msg);
       continue;
     }
-
     // FIX #5: rispetta maxArchiveEntryBytes
-    const sizeBytes = new TextEncoder().encode(fullText).length;
     if (sizeBytes > cfg.maxArchiveEntryBytes) {
-      // Entry troppo grande: salta l'archiviazione, lascia il contenuto originale
+      // Entry too large: skip archiving, leave the original content in place.
       transformed.push(msg);
       continue;
     }
 
     const h = contentHash(fullText);
 
-    // FIX #3: de-dup — already transformed, emit the CITATION, not the original content
-    if (state.transformedHashes.has(h)) {
-      const existingId = state.hashToId.get(h);
-      if (existingId) {
-        const entry = state.activeCitations.get(existingId);
-        if (entry) {
-          const citation = buildCitation(entry);
-          transformed.push({
-            ...m,
-            content: [{ type: 'text', text: citation }],
-            _arcCitation: true,
-            _arcId: existingId,
-          } as unknown as AgentMessage);
-          citations.push(existingId);
-        } else {
-          transformed.push(msg);
-        }
-      } else {
-        transformed.push(msg);
-      }
-      continue;
+    // FIX #3: de-dup — emit the CITATION, never the original content
+    // Look up the memory index first, then the on-disk index: the per-session
+    // map starts empty, so without the disk fallback every re-read of the same
+    // file in a new session would write a duplicate archive entry.
+    const existingId = state.hashToId.get(h) ?? diskIndex().get(h);
+    let entry: ArchiveEntry | undefined;
+    if (existingId) {
+      entry = state.activeCitations.get(existingId);
+      if (!entry) entry = loadEntry(existingId) ?? undefined;
     }
 
-    // FIX #6: lookup O(1) tramite hashToId invece di O(n) linear search
-    const existingId = state.hashToId.get(h);
-    let entry: ArchiveEntry;
-    if (existingId) {
-      const existing = state.activeCitations.get(existingId);
-      if (existing) {
-        entry = existing;
-      } else {
-        // hashToId puntava a un entry cancellato — rigenera
-        const id = generateId();
-        entry = {
-          id,
-          toolCallId: m.toolCallId ?? '',
-          toolName: m.toolName ?? 'unknown',
-          contentHash: h,
-          tokenEstimate: estimateTokens(fullText),
-          sizeBytes,
-          summary: summarizeContent(fullText),
-          timestamp: Date.now(),
-          content: fullText,
-        };
-        storeEntry(entry);
-        state.activeCitations.set(id, entry);
-        state.hashToId.set(h, id);
-        state.totalArchivedTokens += entry.tokenEstimate;
-        state.totalEntries++;
-      }
-    } else {
+    if (!entry) {
+      // Not in memory and not on disk (or purged in between): store it now.
       const id = generateId();
       entry = {
         id,
@@ -455,15 +517,20 @@ function transformContext(
       };
       storeEntry(entry);
       state.activeCitations.set(id, entry);
-      state.hashToId.set(h, id);
       state.totalArchivedTokens += entry.tokenEstimate;
       state.totalEntries++;
+      // Keep the archive bounded: without this it grows without limit, because
+      // the only reducer is a manual age-based purge.
+      enforceArchiveCap(cfg, state);
     }
 
-    // FIX #1: bound transformedHashes per evitare memory leak (max 10000 entry)
+    // Adopt the resolved id for this session, so the next hook is a memory hit.
+    state.hashToId.set(h, entry.id);
+    // Keep the in-memory registry bounded (cap 10000) to avoid a slow leak in
+    // long sessions. Evicting the oldest half is safe: a miss only costs a
+    // diskIndex() lookup.
     state.transformedHashes.set(h, Date.now());
     if (state.transformedHashes.size > 10_000) {
-      // Evict oldest half
       const sorted = [...state.transformedHashes.entries()].sort((a, b) => a[1] - b[1]);
       const toRemove = Math.floor(sorted.length / 2);
       for (let i = 0; i < toRemove; i++) {
@@ -503,11 +570,8 @@ export default function (pi: ExtensionAPI) {
       id: Type.String({ description: 'ID ARC dell\'entry da recuperare (es. "a1b2c3d4e5f6").' }),
       full: Type.Optional(Type.Boolean({ description: 'Restituisce il contenuto completo (default true).' })),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const key = sessionKey(ctx);
-      const st = getState(key);
-      const cf = getConfig(key);
-
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      // arc_recall reads straight from disk by id, so it needs no session state.
       const entry = loadEntry(params.id);
       if (!entry) {
         return {
