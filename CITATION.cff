@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the original paper."
+title: "pi-arc — Addressable Recall Compaction for Pi"
+abstract: >-
+  Implementazione indipendente di Addressable Recall Compaction (ARC) per
+  l'ecosistema Pi, ispirata al paper "Addressable Recall Compaction for Long
+  Context-Window Control in AI Agents" (arXiv:2607.25066). Nessun codice di
+  terzi è stato copiato o forkato; l'implementazione è originale.
+authors:
+  - family-names: "Riccardo"
+    given-names: "BravoRicDev"
+    alias: "BravoRicDev"
+    orcid: ""
+references:
+  - type: article
+    title: "Addressable Recall Compaction for Long Context-Window Control in AI Agents"
+    authors:
+      - family-names: "Dang"
+        given-names: "Thang"
+      - family-names: "Ichikawa"
+        given-names: "Yuma"
+      - family-names: "Fatima"
+        given-names: "Sakina"
+      - family-names: "Shirahata"
+        given-names: "Koichi"
+    year: 2026
+    journal: "arXiv preprint arXiv:2607.25066"
+    doi: "10.48550/arXiv.2607.25066"
+    url: "https://arxiv.org/abs/2607.25066"

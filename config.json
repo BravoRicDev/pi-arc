@@ -1,0 +1,8 @@
+{
+  "canalePeriodico": true,
+  "canaleRandomReview": true,
+  "periodico": "effimero",
+  "ogniTurni": 15,
+  "onCompact": true,
+  "compaction": "effimero"
+}

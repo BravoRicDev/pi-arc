@@ -1,0 +1,38 @@
+MIT License
+
+Copyright (c) 2026 Riccardo (BravoRicDev)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+ADDITIONAL ATTRIBUTION NOTICE
+
+This project is an independent implementation of the technique described in:
+
+  "Addressable Recall Compaction for Long Context-Window Control in AI Agents"
+  Thang Dang, Yuma Ichikawa, Sakina Fatima, Koichi Shirahata
+  arXiv:2607.25066 (2026)
+  https://arxiv.org/abs/2607.25066
+
+The authors of the above paper are the originators of the CONCEPT this software
+implements. This software is an original, independent implementation written
+from the paper description; no source code from the authors or from any third
+party was copied, forked, or adapted. We are grateful to the paper authors for
+the research that makes this possible.

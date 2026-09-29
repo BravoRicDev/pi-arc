@@ -1,0 +1,14 @@
+{
+  "name": "pi-arc",
+  "version": "0.1.0",
+  "description": "Addressable Recall Compaction — ID-addressable archive for lossless context recovery (arxiv 2607.25066)",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

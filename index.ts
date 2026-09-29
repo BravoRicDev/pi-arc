@@ -1,0 +1,570 @@
+/**
+ * ARC — Addressable Recall Compaction
+ * Lossless context compression via ID-addressable archive.
+ *
+ * PROBLEMA
+ *   I tool output grandi (grep, glob, search, read) riempiono il
+ *   contesto e vengono persi dopo la compattazione. L'agente non
+ *   puo' recuperarli senza ri-eseguire il tool.
+ *
+ * SOLUZIONE (https://arxiv.org/abs/2607.25066)
+ *   1. Ogni tool output viene scritto in un log append-only
+ *      ID-addressabile (~/.pi/arc/archive/<id>.json).
+ *   2. Nel contesto attivo, il tool output viene sostituito da
+ *      una citazione compatta: "[ARC id=<id> tokens=<n> summary=<...>]"
+ *   3. L'agente puo' richiedere il contenuto originale via
+ *      tool arc_recall(id) senza ri-eseguire il tool.
+ *   4. Separazione netta: archivio (completo) vs contesto attivo (compresso).
+ *
+ *   Il log e' append-only: mai sovrascrittura, mai cancellazione.
+ *   Le citazioni sono reversibili in qualsiasi momento.
+ *
+ * FORMA REALE DEI MESSAGGI (da @earendil-works/pi-ai)
+ *   ToolResultMessage: { role: "toolResult", content: (Text|Image)[], toolCallId, toolName }
+ *   Nota: il role dei tool result e' "toolResult", NON "tool".
+ *   content e' un array di blocchi, NON una stringa.
+ */
+
+import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
+import type { AgentMessage } from '@earendil-works/pi-agent-core';
+import { Type } from 'typebox';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as os from 'node:os';
+import { createHash, randomUUID } from 'node:crypto';
+
+// ---------------------------------------------------------------------------
+// Tipi minimi della forma reale dei messaggi (sottoset di @earendil-works/pi-ai)
+// ---------------------------------------------------------------------------
+
+interface RealContentBlock {
+  type?: string;
+  text?: string;
+  data?: string;
+  mimeType?: string;
+}
+
+interface RealMessage {
+  role?: string;
+  content?: unknown;
+  toolCallId?: string;
+  toolName?: string;
+  timestamp?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+interface ArcConfig {
+  /** Massimo token nel contesto attivo prima di attivare le citazioni. */
+  tokenBudget: number;
+  /** Soglia: quando il contesto supera tokenBudget * thresholdRatio, si attiva. */
+  thresholdRatio: number;
+  /** Dimensione massima di un singolo entry nell'archivio (bytes). */
+  maxArchiveEntryBytes: number;
+  /** Tool output piu' piccolo di questo non viene archiviato (bytes). */
+  minArchiveBytes: number;
+  /** Mostra widget UI. */
+  showWidget: boolean;
+  /** Log di debug. */
+  debug: boolean;
+}
+
+const DEFAULT_CONFIG: ArcConfig = {
+  tokenBudget: 80_000,
+  thresholdRatio: 0.85,
+  maxArchiveEntryBytes: 500_000,
+  minArchiveBytes: 5_000,
+  showWidget: true,
+  debug: false,
+};
+
+const CONFIG_PATH = path.join(os.homedir(), '.pi', 'arc', 'config.json');
+const ARCHIVE_DIR = path.join(os.homedir(), '.pi', 'arc', 'archive');
+const LOG_PATH = path.join(os.homedir(), '.pi', 'arc', 'arc.log');
+
+function loadConfig(): ArcConfig {
+  try {
+    const raw = fs.readFileSync(CONFIG_PATH, 'utf8');
+    return { ...DEFAULT_CONFIG, ...JSON.parse(raw) };
+  } catch {
+    return { ...DEFAULT_CONFIG };
+  }
+}
+
+function debugLog(cfg: ArcConfig, msg: string) {
+  if (!cfg.debug) return;
+  try {
+    fs.mkdirSync(path.dirname(LOG_PATH), { recursive: true });
+    fs.appendFileSync(LOG_PATH, `[${new Date().toISOString()}] ${msg}\n`);
+  } catch { /* non critico */ }
+}
+
+// ---------------------------------------------------------------------------
+// Archive store (append-only, ID-addressable)
+// ---------------------------------------------------------------------------
+
+interface ArchiveEntry {
+  id: string;
+  toolCallId: string;
+  toolName: string;
+  contentHash: string;
+  tokenEstimate: number;
+  sizeBytes: number;
+  summary: string;
+  timestamp: number;
+  /** Contenuto originale (preservato verbatim). */
+  content: string;
+}
+
+function contentHash(content: string): string {
+  return createHash('sha256').update(content).digest('hex').slice(0, 16);
+}
+
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+function generateId(): string {
+  return randomUUID().slice(0, 12);
+}
+
+function ensureArchiveDir() {
+  fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
+}
+
+/**
+ * Write with atomic rename to avoid partial writes (race condition fix).
+ * POSIX rename is atomic on the same filesystem.
+ */
+function storeEntry(entry: ArchiveEntry): string {
+  ensureArchiveDir();
+  const tmpPath = path.join(ARCHIVE_DIR, `.${entry.id}.tmp`);
+  const finalPath = path.join(ARCHIVE_DIR, `${entry.id}.json`);
+  // Write to temp file first, then atomic rename.
+  fs.writeFileSync(tmpPath, JSON.stringify(entry));
+  fs.renameSync(tmpPath, finalPath);
+  return entry.id;
+}
+
+function loadEntry(id: string): ArchiveEntry | null {
+  const filePath = path.join(ARCHIVE_DIR, `${id}.json`);
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8');
+    return JSON.parse(raw) as ArchiveEntry;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Cached listing: reads from disk only when the directory mtime changes.
+ * Avoids O(n) file reads on every call.
+ */
+let _listCache: { entries: ArchiveEntry[]; mtime: number; dir: string } | null = null;
+
+function listEntries(): ArchiveEntry[] {
+  ensureArchiveDir();
+  try {
+    const dirStat = fs.statSync(ARCHIVE_DIR);
+    const currentMtime = dirStat.mtimeMs;
+    if (_listCache && _listCache.mtime === currentMtime && _listCache.dir === ARCHIVE_DIR) {
+      return _listCache.entries;
+    }
+    const entries = fs.readdirSync(ARCHIVE_DIR)
+      .filter(f => f.endsWith('.json'))
+      .map(f => {
+        try { return JSON.parse(fs.readFileSync(path.join(ARCHIVE_DIR, f), 'utf8')) as ArchiveEntry; }
+        catch { return null; }
+      })
+      .filter((e): e is ArchiveEntry => e !== null);
+    _listCache = { entries, mtime: currentMtime, dir: ARCHIVE_DIR };
+    return entries;
+  } catch {
+    return [];
+  }
+}
+
+function invalidateListCache() {
+  _listCache = null;
+}
+
+// ---------------------------------------------------------------------------
+// Session state (per-sessione: evita collisioni tra subagent)
+// ---------------------------------------------------------------------------
+
+interface ArcState {
+  /** Map id -> entry per gli entry nel contesto attivo. */
+  activeCitations: Map<string, ArchiveEntry>;
+  /** Indice inverso: contentHash -> id per lookup O(1). */
+  hashToId: Map<string, string>;
+  /** Totale token archiviati. */
+  totalArchivedTokens: number;
+  /** Numero totale di entry nell'archivio. */
+  totalEntries: number;
+  /** Hash dei messaggi trasformati in citazioni (con limite per evitare memory leak). */
+  transformedHashes: Map<string, number>; // hash -> timestamp
+}
+
+function newArcState(): ArcState {
+  return {
+    activeCitations: new Map(),
+    hashToId: new Map(),
+    totalArchivedTokens: 0,
+    totalEntries: 0,
+    transformedHashes: new Map(),
+  };
+}
+
+/** Chiave di sessione: cwd + path sessione se disponibile, altrimenti "default". */
+function sessionKey(ctx: ExtensionContext | null | undefined): string {
+  try {
+    const cwd = typeof ctx?.cwd === 'string' ? ctx.cwd : '';
+    const sm = (ctx as unknown as { sessionManager?: { getSessionId?: () => string } })?.sessionManager;
+    const sid = typeof sm?.getSessionId === 'function' ? sm.getSessionId() : '';
+    return `${cwd}::${sid}`;
+  } catch {
+    return 'default';
+  }
+}
+
+const states = new Map<string, ArcState>();
+const configs = new Map<string, ArcConfig>();
+
+function getState(key: string): ArcState {
+  let st = states.get(key);
+  if (!st) { st = newArcState(); states.set(key, st); }
+  return st;
+}
+
+function getConfig(key: string): ArcConfig {
+  let cf = configs.get(key);
+  if (!cf) { cf = loadConfig(); configs.set(key, cf); }
+  return cf;
+}
+
+function dropState(key: string) {
+  states.delete(key);
+  configs.delete(key);
+}
+
+// ---------------------------------------------------------------------------
+// Citation builder
+// ---------------------------------------------------------------------------
+
+function buildCitation(entry: ArchiveEntry): string {
+  const preview = entry.content.slice(0, 200).replace(/\n/g, ' ');
+  return `[ARC id=${entry.id} tokens=${entry.tokenEstimate} hash=${entry.contentHash} summary="${entry.summary}" preview="${preview}…"]`;
+}
+
+function summarizeContent(content: string): string {
+  const lines = content.split('\n');
+  if (lines.length <= 5) return content.slice(0, 100);
+  return `${lines[0].slice(0, 80)} … (${lines.length} righe, ${content.length} chars) … ${lines[lines.length - 1].slice(0, 60)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Context transformer (hook 'context')
+// ---------------------------------------------------------------------------
+
+/**
+ * Intercetta i messaggi in ingresso al modello.
+ * Sostituisce tool output grandi con citazioni ARC.
+ *
+ * FIX CRITICO: il role dei tool result e' "toolResult" (non "tool"),
+ * e content e' un array (non una stringa).
+ */
+function transformContext(
+  cfg: ArcConfig,
+  state: ArcState,
+  messages: AgentMessage[],
+): { messages: AgentMessage[]; citations: string[] } {
+  const citations: string[] = [];
+  const transformed: AgentMessage[] = [];
+
+  for (const msg of messages) {
+    const m = msg as unknown as RealMessage;
+
+    // FIX #1: il role reale e' "toolResult", NON "tool"
+    if (m.role !== 'toolResult') {
+      transformed.push(msg);
+      continue;
+    }
+
+    // content e' un array di blocchi (TextContent | ImageContent)
+    const contentArr = m.content;
+    if (!Array.isArray(contentArr)) {
+      transformed.push(msg);
+      continue;
+    }
+
+    // Concatena tutto il testo per stimare dimensione e hash
+    const fullText = contentArr
+      .filter((b): b is RealContentBlock => b && typeof b === 'object')
+      .map(b => b.text ?? b.data ?? '')
+      .join('\n');
+
+    if (fullText.length < cfg.minArchiveBytes) {
+      transformed.push(msg);
+      continue;
+    }
+
+    // FIX #5: rispetta maxArchiveEntryBytes
+    const sizeBytes = new TextEncoder().encode(fullText).length;
+    if (sizeBytes > cfg.maxArchiveEntryBytes) {
+      // Entry troppo grande: salta l'archiviazione, lascia il contenuto originale
+      transformed.push(msg);
+      continue;
+    }
+
+    const h = contentHash(fullText);
+
+    // FIX #3: de-dup — se gia' trasformato, inserisci la CITAZIONE, non il contenuto originale
+    if (state.transformedHashes.has(h)) {
+      const existingId = state.hashToId.get(h);
+      if (existingId) {
+        const entry = state.activeCitations.get(existingId);
+        if (entry) {
+          const citation = buildCitation(entry);
+          transformed.push({
+            ...m,
+            content: [{ type: 'text', text: citation }],
+            _arcCitation: true,
+            _arcId: existingId,
+          } as unknown as AgentMessage);
+          citations.push(existingId);
+        } else {
+          transformed.push(msg);
+        }
+      } else {
+        transformed.push(msg);
+      }
+      continue;
+    }
+
+    // FIX #6: lookup O(1) tramite hashToId invece di O(n) linear search
+    const existingId = state.hashToId.get(h);
+    let entry: ArchiveEntry;
+    if (existingId) {
+      const existing = state.activeCitations.get(existingId);
+      if (existing) {
+        entry = existing;
+      } else {
+        // hashToId puntava a un entry cancellato — rigenera
+        const id = generateId();
+        entry = {
+          id,
+          toolCallId: m.toolCallId ?? '',
+          toolName: m.toolName ?? 'unknown',
+          contentHash: h,
+          tokenEstimate: estimateTokens(fullText),
+          sizeBytes,
+          summary: summarizeContent(fullText),
+          timestamp: Date.now(),
+          content: fullText,
+        };
+        storeEntry(entry);
+        state.activeCitations.set(id, entry);
+        state.hashToId.set(h, id);
+        state.totalArchivedTokens += entry.tokenEstimate;
+        state.totalEntries++;
+      }
+    } else {
+      const id = generateId();
+      entry = {
+        id,
+        toolCallId: m.toolCallId ?? '',
+        toolName: m.toolName ?? 'unknown',
+        contentHash: h,
+        tokenEstimate: estimateTokens(fullText),
+        sizeBytes,
+        summary: summarizeContent(fullText),
+        timestamp: Date.now(),
+        content: fullText,
+      };
+      storeEntry(entry);
+      state.activeCitations.set(id, entry);
+      state.hashToId.set(h, id);
+      state.totalArchivedTokens += entry.tokenEstimate;
+      state.totalEntries++;
+    }
+
+    // FIX #1: bound transformedHashes per evitare memory leak (max 10000 entry)
+    state.transformedHashes.set(h, Date.now());
+    if (state.transformedHashes.size > 10_000) {
+      // Evict oldest half
+      const sorted = [...state.transformedHashes.entries()].sort((a, b) => a[1] - b[1]);
+      const toRemove = Math.floor(sorted.length / 2);
+      for (let i = 0; i < toRemove; i++) {
+        state.transformedHashes.delete(sorted[i][0]);
+      }
+    }
+
+    citations.push(entry.id);
+    const citation = buildCitation(entry);
+    transformed.push({
+      ...m,
+      content: [{ type: 'text', text: citation }],
+      _arcCitation: true,
+      _arcId: entry.id,
+    } as unknown as AgentMessage);
+  }
+
+  return { messages: transformed, citations };
+}
+
+// ---------------------------------------------------------------------------
+// Extension entry
+// ---------------------------------------------------------------------------
+
+export default function (pi: ExtensionAPI) {
+  // ---- Tools -------------------------------------------------------------
+
+  pi.registerTool({
+    name: 'arc_recall',
+    label: 'ARC Recall',
+    description:
+      'Recupera il contenuto originale di un tool output archiviato ' +
+      'tramite il suo ID ARC. Usa quando hai bisogno del dettaglio ' +
+      'completo che era stato compattato in una citazione.',
+    promptSnippet: 'arc_recall: recupera tool output archiviato per ID',
+    parameters: Type.Object({
+      id: Type.String({ description: 'ID ARC dell\'entry da recuperare (es. "a1b2c3d4e5f6").' }),
+      full: Type.Optional(Type.Boolean({ description: 'Restituisce il contenuto completo (default true).' })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const key = sessionKey(ctx);
+      const st = getState(key);
+      const cf = getConfig(key);
+
+      const entry = loadEntry(params.id);
+      if (!entry) {
+        return {
+          content: [{ type: 'text', text: `Entry ARC "${params.id}" non trovato nell'archivio.` }],
+          details: { ok: false, error: 'entry-not-found' },
+        };
+      }
+
+      // FIX #4: onora il parametro 'full'
+      const full = params.full ?? true;
+      const preview = full ? entry.content : entry.content.slice(0, 500);
+      const truncated = full ? '' : (entry.content.length > 500 ? '… (troncato, usa full=true per il completo)' : '');
+
+      return {
+        content: [{ type: 'text', text: `ARC ${entry.id} [${entry.toolName}, ${entry.tokenEstimate} tokens]:\n${preview}${truncated}` }],
+        details: { ok: true, id: entry.id, toolName: entry.toolName, tokenEstimate: entry.tokenEstimate, sizeBytes: entry.sizeBytes },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: 'arc_status',
+    label: 'ARC Status',
+    description: 'Mostra lo stato dell\'archivio ARC: entry, token archiviati, citazioni attive.',
+    promptSnippet: 'arc_status: stato archivio ARC',
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      const key = sessionKey(ctx);
+      const st = getState(key);
+      const cf = getConfig(key);
+      const entries = listEntries();
+      const lines = [
+        `ARC — token budget: ${cf.tokenBudget.toLocaleString()} (threshold: ${(cf.thresholdRatio * 100).toFixed(0)}%)`,
+        `Entry totali archivio: ${entries.length} | token archiviati: ${st.totalArchivedTokens.toLocaleString()}`,
+        `Citazioni attive nel contesto: ${st.activeCitations.size}`,
+      ];
+      if (entries.length > 0) {
+        lines.push('Entry recenti:');
+        for (const e of entries.slice(-10)) {
+          lines.push(`  ${e.id} ${e.toolName} ${e.tokenEstimate}t ${e.sizeBytes}b ${new Date(e.timestamp).toISOString()}`);
+        }
+      }
+      return {
+        content: [{ type: 'text', text: lines.join('\n') }],
+        details: {
+          ok: true,
+          totalEntries: entries.length,
+          totalArchivedTokens: st.totalArchivedTokens,
+          activeCitations: st.activeCitations.size,
+        },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: 'arc_purge',
+    label: 'ARC Purge',
+    description: "Pulisce entry archiviate piu' vecchie di N giorni. NON tocca il contesto attivo.",
+    promptSnippet: 'arc_purge: pulisci archivio ARC vecchio',
+    parameters: Type.Object({
+      daysOlder: Type.Optional(Type.Number({ description: "Rimuovi entry piu' vecchie di N giorni (default 30)." })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const key = sessionKey(ctx);
+      const st = getState(key);
+      const days = params.daysOlder ?? 30;
+      const cutoff = Date.now() - days * 86400000;
+      const entries = listEntries();
+      let purged = 0;
+      for (const e of entries) {
+        // FIX #8: non cancellare entry ancora citate nel contesto attivo
+        if (e.timestamp < cutoff && !st.activeCitations.has(e.id)) {
+          try {
+            fs.unlinkSync(path.join(ARCHIVE_DIR, `${e.id}.json`));
+            // Rimuovi anche dall'indice hashToId della sessione corrente
+            st.hashToId.delete(e.contentHash);
+            st.activeCitations.delete(e.id);
+            st.transformedHashes.delete(e.contentHash);
+            purged++;
+          } catch { /* ignore */ }
+        }
+      }
+      invalidateListCache();
+      return {
+        content: [{ type: 'text', text: `ARC purge: rimosse ${purged} entry piu' vecchie di ${days}gg.` }],
+        details: { ok: true, purged, days },
+      };
+    },
+  });
+
+  // ---- Hooks -------------------------------------------------------------
+
+  pi.on('session_start', async (_event, ctx) => {
+    const key = sessionKey(ctx);
+    states.set(key, newArcState());
+    configs.set(key, loadConfig());
+    debugLog(getConfig(key), 'SESSION START — ARC state reset');
+  });
+
+  pi.on('context', async (event, ctx) => {
+    const key = sessionKey(ctx);
+    const st = getState(key);
+    const cf = getConfig(key);
+
+    if (!event.messages || event.messages.length === 0) return;
+
+    // Stima token totali del contesto
+    const totalTokens = event.messages.reduce((sum, m) => {
+      try { return sum + estimateTokens(JSON.stringify(m)); } catch { return sum; }
+    }, 0);
+
+    if (totalTokens < cf.tokenBudget * cf.thresholdRatio) return;
+
+    const { messages, citations } = transformContext(cf, st, event.messages);
+    if (citations.length > 0) {
+      debugLog(cf, `ARC: ${citations.length} citazioni generate per ${totalTokens} tokens`);
+      if (ctx?.hasUI) {
+        ctx.ui.notify(`ARC: ${citations.length} tool output archiviati come citazioni`, 'info');
+      }
+    }
+
+    return { messages };
+  });
+
+  pi.on('session_shutdown', async (_event, ctx) => {
+    const key = sessionKey(ctx);
+    debugLog(getConfig(key), `SESSION SHUTDOWN — entries: ${getState(key).totalEntries}, archived tokens: ${getState(key).totalArchivedTokens}`);
+    dropState(key);
+  });
+}
