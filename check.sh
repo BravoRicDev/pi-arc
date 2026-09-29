@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Typecheck di pi-anti-amnesia contro i tipi globali dell'installazione Pi.
-# I tipi (@earendil-works/pi-coding-agent, typebox) sono risolti via `paths`
-# in tsconfig.check.json, quindi non serve un node_modules locale.
+# Typecheck + smoke load for pi-arc.
+# The Pi types (@earendil-works/pi-coding-agent, typebox) are resolved through
+# the `paths` mapping in tsconfig.json, so no local node_modules is needed.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -11,6 +11,7 @@ if [ -z "$TSC" ]; then
     TSC="$(command -v tsc)"
   else
     for c in \
+      /home/riccardo/.hermes/lsp/node_modules/typescript/bin/tsc \
       /home/riccardo/PiAgent/plugins/*/node_modules/.bin/tsc \
       /home/riccardo/.hermes/node/lib/node_modules/typescript/bin/tsc; do
       if [ -x "$c" ]; then TSC="$c"; break; fi
@@ -19,10 +20,14 @@ if [ -z "$TSC" ]; then
 fi
 
 if [ -z "$TSC" ] || [ ! -x "$TSC" ]; then
-  echo "tsc non trovato. Imposta TSC=/percorso/tsc oppure installa typescript." >&2
+  echo "tsc not found. Set TSC=/path/to/tsc or install typescript." >&2
   exit 1
 fi
 
 "$TSC" -p tsconfig.check.json "$@"
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
-node --test tests/topic-scope.test.mjs tests/extension-flow.test.mjs
+
+# Loads the REAL module. The typecheck cannot see a runtime failure during
+# module evaluation (a temporal dead zone, an uninitialised binding, a broken
+# import), and such a failure kills the extension silently: no tools
+# registered, no message to the user, and a green typecheck.
+node --test tests/smoke-load.test.mjs

@@ -3,6 +3,7 @@
   "thresholdRatio": 0.85,
   "maxArchiveEntryBytes": 500000,
   "minArchiveBytes": 5000,
+  "maxArchiveTotalBytes": 200000000,
   "showWidget": true,
   "debug": false
 }
