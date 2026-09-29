@@ -2,27 +2,27 @@
  * ARC — Addressable Recall Compaction
  * Lossless context compression via ID-addressable archive.
  *
- * PROBLEMA
- *   I tool output grandi (grep, glob, search, read) riempiono il
- *   contesto e vengono persi dopo la compattazione. L'agente non
- *   puo' recuperarli senza ri-eseguire il tool.
+ * PROBLEM
+ *   Large tool outputs (grep, glob, search, read) fill up the
+ *   context and are lost after compaction. The agent cannot
+ *   retrieve them again without re-running the tool.
  *
- * SOLUZIONE (https://arxiv.org/abs/2607.25066)
- *   1. Ogni tool output viene scritto in un log append-only
- *      ID-addressabile (~/.pi/arc/archive/<id>.json).
- *   2. Nel contesto attivo, il tool output viene sostituito da
- *      una citazione compatta: "[ARC id=<id> tokens=<n> summary=<...>]"
+ * SOLUTION (https://arxiv.org/abs/2607.25066)
+ *   1. Every tool output is written to an append-only,
+ *      ID-addressable log (~/.pi/arc/archive/<id>.json).
+ *   2. In the active context, the tool output is replaced by
+ *      a compact citation: "[ARC id=<id> tokens=<n> summary=<...>]"
  *   3. The agent can request the original content via
- *      tool arc_recall(id) senza ri-eseguire il tool.
- *   4. Separazione netta: archivio (completo) vs contesto attivo (compresso).
+ *      tool arc_recall(id) without re-running the tool.
+ *   4. Clean separation: archive (complete) vs active context (compressed).
  *
- *   Il log e' append-only: mai sovrascrittura, mai cancellazione.
- *   Le citazioni sono reversibili in qualsiasi momento.
+ *   The log is append-only: never overwritten, never deleted.
+ *   Citations are reversible at any time.
  *
- * FORMA REALE DEI MESSAGGI (da @earendil-works/pi-ai)
+ * REAL MESSAGE SHAPE (from @earendil-works/pi-ai)
  *   ToolResultMessage: { role: "toolResult", content: (Text|Image)[], toolCallId, toolName }
- *   Nota: il role dei tool result e' "toolResult", NON "tool".
- *   content e' un array di blocchi, NON una stringa.
+ *   Note: the tool result role is "toolResult", NOT "tool".
+ *   content is an array of blocks, NOT a string.
  */
 
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
@@ -35,7 +35,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 // ---------------------------------------------------------------------------
-// Tipi minimi della forma reale dei messaggi (sottoset di @earendil-works/pi-ai)
+// Minimal types for the real message shape (subset of @earendil-works/pi-ai)
 // ---------------------------------------------------------------------------
 
 interface RealContentBlock {
@@ -60,23 +60,23 @@ interface RealMessage {
 // ---------------------------------------------------------------------------
 
 interface ArcConfig {
-  /** Massimo token nel contesto attivo prima di attivare le citazioni. */
+  /** Maximum tokens in the active context before citations kick in. */
   tokenBudget: number;
-  /** Soglia: quando il contesto supera tokenBudget * thresholdRatio, si attiva. */
+  /** Threshold: activates when the context exceeds tokenBudget * thresholdRatio. */
   thresholdRatio: number;
-  /** Dimensione massima di un singolo entry nell'archivio (bytes). */
+  /** Maximum size of a single archive entry (bytes). */
   maxArchiveEntryBytes: number;
-  /** Tool output piu' piccolo di questo non viene archiviato (bytes). */
+  /** Tool output smaller than this is not archived (bytes). */
   minArchiveBytes: number;
   /**
-   * Tetto sul TOTALE dell'archivio. L'archivio e' append-only e la purge e'
-   * solo per eta' e manuale: senza questo, un'installazione a lungo termine
-   * accumula GB (ogni entry puo' arrivare a maxArchiveEntryBytes).
+   * Cap on the archive TOTAL. The archive is append-only and the purge is
+   * by age only and manual: without this, a long-lived installation
+   * grows without bound (each entry can reach maxArchiveEntryBytes).
    */
   maxArchiveTotalBytes: number;
-  /** Mostra widget UI. */
+  /** Shows the UI widget. */
   showWidget: boolean;
-  /** Log di debug. */
+  /** Debug logging. */
   debug: boolean;
 }
 
@@ -138,6 +138,19 @@ type ArcMessages = {
   recallTruncated: string;
   purgeDone: (purged: number, days: number) => string;
   purgeNothing: string;
+  /** arc_status output lines (they go into the LLM context). */
+  statusArchive: (entries: number, tokens: string) => string;
+  statusCitations: (active: number) => string;
+  statusRecent: string;
+  /** UI notice after a context transform. */
+  citationsNotice: (count: number) => string;
+  /** Texts that end up in the LLM context. */
+  snippets: { recall: string; status: string; purge: string };
+  /** Parameter descriptions: read by the LLM on every invocation. */
+  params: {
+    recallDesc: string; id: string; full: string;
+    statusDesc: string; purgeDesc: string; daysOlder: string;
+  };
 };
 
 const I18N: Record<Lang, ArcMessages> = {
@@ -145,13 +158,47 @@ const I18N: Record<Lang, ArcMessages> = {
     entryNotFound: (id) => `ARC entry "${id}" not found in the archive.`,
     recallTruncated: '… (truncated, use full=true for the complete content)',
     purgeDone: (purged, days) => `ARC purge: removed ${purged} entries older than ${days}d.`,
-    purgeNothing: 'No orphan entry to remove.',
+    purgeNothing: 'No entry older than the given age to remove.',
+    statusArchive: (entries, tokens) => `Archive entries: ${entries} | archived tokens: ${tokens}`,
+    statusCitations: (active) => `Active citations in the context: ${active}`,
+    statusRecent: 'Recent entries:',
+    citationsNotice: (count) => `ARC: ${count} tool outputs archived as citations`,
+    snippets: {
+      recall: 'arc_recall: retrieve an archived tool output by ID',
+      status: 'arc_status: ARC archive status',
+      purge: 'arc_purge: purge old ARC archive entries',
+    },
+    params: {
+      recallDesc: 'Retrieves the original content of an archived tool output by its ARC ID. Use it when you need the full detail that was compacted into a citation.',
+      id: 'ARC entry ID to retrieve (e.g. "a1b2c3d4e5f6").',
+      full: 'Returns the complete content (default true).',
+      statusDesc: 'Shows the ARC archive status: entries, archived tokens, active citations.',
+      purgeDesc: 'Purges archived entries older than N days. Does NOT touch the active context.',
+      daysOlder: 'Remove entries older than N days (default 30).',
+    },
   },
   it: {
     entryNotFound: (id) => `Entry ARC "${id}" non trovato nell'archivio.`,
     recallTruncated: '… (troncato, usa full=true per il contenuto completo)',
     purgeDone: (purged, days) => `ARC purge: rimosse ${purged} entry piu' vecchie di ${days}gg.`,
-    purgeNothing: 'Nessun job orfano da rimuovere.',
+    purgeNothing: "Nessuna entry piu' vecchia da rimuovere.",
+    statusArchive: (entries, tokens) => `Entry totali archivio: ${entries} | token archiviati: ${tokens}`,
+    statusCitations: (active) => `Citazioni attive nel contesto: ${active}`,
+    statusRecent: 'Entry recenti:',
+    citationsNotice: (count) => `ARC: ${count} tool output archiviati come citazioni`,
+    snippets: {
+      recall: 'arc_recall: recupera un tool output archiviato per ID',
+      status: 'arc_status: stato dell\'archivio ARC',
+      purge: 'arc_purge: purifica le entry vecchie dell\'archivio ARC',
+    },
+    params: {
+      recallDesc: 'Recupera il contenuto originale di un tool output archiviato tramite il suo ID ARC. Usa quando hai bisogno del dettaglio completo che era stato compattato in una citazione.',
+      id: 'ID dell\'entry ARC da recuperare (es. "a1b2c3d4e5f6").',
+      full: 'Restituisce il contenuto completo (default true).',
+      statusDesc: 'Mostra lo stato dell\'archivio ARC: entry, token archiviati, citazioni attive.',
+      purgeDesc: 'Purga le entry archiviate piu\' vecchie di N giorni. NON tocca il contesto attivo.',
+      daysOlder: 'Rimuove le entry piu\' vecchie di N giorni (default 30).',
+    },
   },
 } satisfies Record<Lang, ArcMessages>;
 
@@ -160,9 +207,9 @@ function t<K extends keyof ArcMessages>(key: K): ArcMessages[K] {
   return I18N[LANG][key];
 }
 
-// Config utente: ~/.pi/arc/config.json. Se assente si cade sul config incluso
-// nell'estensione, cosi' il file distribuito col repo serve davvero a qualcosa
-// invece di restare un documento morto.
+// User config: ~/.pi/arc/config.json. When absent we fall back to the config
+// bundled with the extension, so the file shipped with the repo actually does something
+// instead of being a dead document.
 const _EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = path.join(os.homedir(), '.pi', 'arc', 'config.json');
 const BUNDLED_CONFIG_PATH = path.join(_EXT_DIR, 'config.json');
@@ -175,7 +222,7 @@ function loadConfig(): ArcConfig {
       const raw = fs.readFileSync(candidate, 'utf8');
       return { ...DEFAULT_CONFIG, ...JSON.parse(raw) as Partial<ArcConfig> };
     } catch {
-      // prova il candidato successivo
+      // try the next candidate
     }
   }
   return { ...DEFAULT_CONFIG };
@@ -186,7 +233,7 @@ function debugLog(cfg: ArcConfig, msg: string) {
   try {
     fs.mkdirSync(path.dirname(LOG_PATH), { recursive: true });
     fs.appendFileSync(LOG_PATH, `[${new Date().toISOString()}] ${msg}\n`);
-  } catch { /* non critico */ }
+  } catch { /* not critical */ }
 }
 
 // ---------------------------------------------------------------------------
@@ -202,7 +249,7 @@ interface ArchiveEntry {
   sizeBytes: number;
   summary: string;
   timestamp: number;
-  /** Contenuto originale (preservato verbatim). */
+  /** Original content (preserved verbatim). */
   content: string;
 }
 
@@ -347,15 +394,15 @@ function diskIndex(): Map<string, string> {
 // ---------------------------------------------------------------------------
 
 interface ArcState {
-  /** Map id -> entry per gli entry nel contesto attivo. */
+  /** Map id -> entry for the entries in the active context. */
   activeCitations: Map<string, ArchiveEntry>;
-  /** Indice inverso: contentHash -> id per lookup O(1). */
+  /** Reverse index: contentHash -> id for O(1) lookup. */
   hashToId: Map<string, string>;
-  /** Totale token archiviati. */
+  /** Total archived tokens. */
   totalArchivedTokens: number;
-  /** Numero totale di entry nell'archivio. */
+  /** Total number of entries in the archive. */
   totalEntries: number;
-  /** Hash dei messaggi trasformati in citazioni (con limite per evitare memory leak). */
+  /** Hashes of the messages turned into citations (bounded to avoid a memory leak). */
   transformedHashes: Map<string, number>; // hash -> timestamp
 }
 
@@ -369,10 +416,12 @@ function newArcState(): ArcState {
   };
 }
 
-/** Chiave di sessione: cwd + path sessione se disponibile, altrimenti "default". */
+/** Session key: cwd + session path when available, otherwise "default". */
 function sessionKey(ctx: ExtensionContext | null | undefined): string {
   try {
     const cwd = typeof ctx?.cwd === 'string' ? ctx.cwd : '';
+    // SAFETY: ExtensionContext does not declare sessionManager; probe it as an
+    // optional shape and degrade to "default" when it is absent.
     const sm = (ctx as unknown as { sessionManager?: { getSessionId?: () => string } })?.sessionManager;
     const sid = typeof sm?.getSessionId === 'function' ? sm.getSessionId() : '';
     return `${cwd}::${sid}`;
@@ -413,7 +462,7 @@ function buildCitation(entry: ArchiveEntry): string {
 function summarizeContent(content: string): string {
   const lines = content.split('\n');
   if (lines.length <= 5) return content.slice(0, 100);
-  return `${lines[0].slice(0, 80)} … (${lines.length} righe, ${content.length} chars) … ${lines[lines.length - 1].slice(0, 60)}`;
+  return `${lines[0].slice(0, 80)} … (${lines.length} lines, ${content.length} chars) … ${lines[lines.length - 1].slice(0, 60)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -421,11 +470,11 @@ function summarizeContent(content: string): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Intercetta i messaggi in ingresso al modello.
- * Sostituisce tool output grandi con citazioni ARC.
+ * Intercepts the messages coming into the model.
+ * Replaces large tool outputs with ARC citations.
  *
- * FIX CRITICO: il role dei tool result e' "toolResult" (non "tool"),
- * e content e' un array (non una stringa).
+ * CRITICAL FIX: the tool result role is "toolResult" (not "tool"),
+ * and content is an array (not a string).
  */
 function transformContext(
   cfg: ArcConfig,
@@ -441,6 +490,7 @@ function transformContext(
   // Citations only live as long as the message carrying them, so prune here.
   const liveIds = new Set<string>();
   for (const m of messages) {
+    // SAFETY: read-only probe of the optional _arcId marker this extension adds.
     const r = (m as unknown as RealMessage);
     if (r && r._arcId) liveIds.add(r._arcId);
   }
@@ -451,22 +501,23 @@ function transformContext(
   }
 
   for (const msg of messages) {
+    // SAFETY: read-only field probe (role/content); the union does not expose them.
     const m = msg as unknown as RealMessage;
 
-    // FIX #1: il role reale e' "toolResult", NON "tool"
+    // FIX #1: the real role is "toolResult", NOT "tool"
     if (m.role !== 'toolResult') {
       transformed.push(msg);
       continue;
     }
 
-    // content e' un array di blocchi (TextContent | ImageContent)
+    // content is an array of blocks (TextContent | ImageContent)
     const contentArr = m.content;
     if (!Array.isArray(contentArr)) {
       transformed.push(msg);
       continue;
     }
 
-    // Concatena tutto il testo per stimare dimensione e hash
+    // Concatenate all the text to estimate size and hash
     const fullText = contentArr
       .filter((b): b is RealContentBlock => b && typeof b === 'object')
       .map(b => b.text ?? b.data ?? '')
@@ -481,7 +532,7 @@ function transformContext(
       transformed.push(msg);
       continue;
     }
-    // FIX #5: rispetta maxArchiveEntryBytes
+    // FIX #5: respect maxArchiveEntryBytes
     if (sizeBytes > cfg.maxArchiveEntryBytes) {
       // Entry too large: skip archiving, leave the original content in place.
       transformed.push(msg);
@@ -540,6 +591,8 @@ function transformContext(
 
     citations.push(entry.id);
     const citation = buildCitation(entry);
+    // SAFETY: the extra _arcCitation/_arcId keys are this extension's own markers
+    // on the message; the AgentMessage union does not declare them.
     transformed.push({
       ...m,
       content: [{ type: 'text', text: citation }],
@@ -562,13 +615,12 @@ export default function (pi: ExtensionAPI) {
     name: 'arc_recall',
     label: 'ARC Recall',
     description:
-      'Recupera il contenuto originale di un tool output archiviato ' +
-      'tramite il suo ID ARC. Usa quando hai bisogno del dettaglio ' +
-      'completo che era stato compattato in una citazione.',
-    promptSnippet: 'arc_recall: recupera tool output archiviato per ID',
+      'Retrieves the original content of an archived tool output by its ARC ID. ' +
+      'Use it when you need the full detail that was compacted into a citation.',
+    promptSnippet: t('snippets').recall,
     parameters: Type.Object({
-      id: Type.String({ description: 'ID ARC dell\'entry da recuperare (es. "a1b2c3d4e5f6").' }),
-      full: Type.Optional(Type.Boolean({ description: 'Restituisce il contenuto completo (default true).' })),
+      id: Type.String({ description: t('params').id }),
+      full: Type.Optional(Type.Boolean({ description: t('params').full, })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       // arc_recall reads straight from disk by id, so it needs no session state.
@@ -580,7 +632,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // FIX #4: onora il parametro 'full'
+      // FIX #4: honour the 'full' parameter
       const full = params.full ?? true;
       const preview = full ? entry.content : entry.content.slice(0, 500);
       const truncated = full ? '' : (entry.content.length > 500 ? t('recallTruncated') : '');
@@ -595,8 +647,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: 'arc_status',
     label: 'ARC Status',
-    description: 'Mostra lo stato dell\'archivio ARC: entry, token archiviati, citazioni attive.',
-    promptSnippet: 'arc_status: stato archivio ARC',
+    description: t('params').statusDesc,
+    promptSnippet: t('snippets').status,
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const key = sessionKey(ctx);
@@ -605,11 +657,11 @@ export default function (pi: ExtensionAPI) {
       const entries = listEntries();
       const lines = [
         `ARC — token budget: ${cf.tokenBudget.toLocaleString()} (threshold: ${(cf.thresholdRatio * 100).toFixed(0)}%)`,
-        `Entry totali archivio: ${entries.length} | token archiviati: ${st.totalArchivedTokens.toLocaleString()}`,
-        `Citazioni attive nel contesto: ${st.activeCitations.size}`,
+        t('statusArchive')(entries.length, st.totalArchivedTokens.toLocaleString()),
+        t('statusCitations')(st.activeCitations.size),
       ];
       if (entries.length > 0) {
-        lines.push('Entry recenti:');
+        lines.push(t('statusRecent'));
         for (const e of entries.slice(-10)) {
           lines.push(`  ${e.id} ${e.toolName} ${e.tokenEstimate}t ${e.sizeBytes}b ${new Date(e.timestamp).toISOString()}`);
         }
@@ -629,10 +681,10 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: 'arc_purge',
     label: 'ARC Purge',
-    description: 'Purges archived entries older than N days. Does NOT touch the active context.',
-    promptSnippet: 'arc_purge: pulisci archivio ARC vecchio',
+    description: t('params').purgeDesc,
+    promptSnippet: t('snippets').purge,
     parameters: Type.Object({
-      daysOlder: Type.Optional(Type.Number({ description: 'Remove entries older than N days (default 30).' })),
+      daysOlder: Type.Optional(Type.Number({ description: t('params').daysOlder, })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const key = sessionKey(ctx);
@@ -642,7 +694,7 @@ export default function (pi: ExtensionAPI) {
       const entries = listEntries();
       let purged = 0;
       for (const e of entries) {
-        // FIX #8: non cancellare entry ancora citate nel contesto attivo
+        // FIX #8: do not delete entries still cited in the active context
         if (e.timestamp < cutoff && !st.activeCitations.has(e.id)) {
           try {
             fs.unlinkSync(path.join(ARCHIVE_DIR, `${e.id}.json`));
@@ -687,9 +739,9 @@ export default function (pi: ExtensionAPI) {
 
     const { messages, citations } = transformContext(cf, st, event.messages);
     if (citations.length > 0) {
-      debugLog(cf, `ARC: ${citations.length} citazioni generate per ${totalTokens} tokens`);
+      debugLog(cf, `ARC: ${citations.length} citations generated for ${totalTokens} tokens`);
       if (ctx?.hasUI) {
-        ctx.ui.notify(`ARC: ${citations.length} tool output archiviati come citazioni`, 'info');
+        ctx.ui.notify(t('citationsNotice')(citations.length), 'info');
       }
     }
 

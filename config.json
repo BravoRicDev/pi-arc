@@ -1,8 +1,8 @@
 {
-  "canalePeriodico": true,
-  "canaleRandomReview": true,
-  "periodico": "effimero",
-  "ogniTurni": 15,
-  "onCompact": true,
-  "compaction": "effimero"
+  "tokenBudget": 80000,
+  "thresholdRatio": 0.85,
+  "maxArchiveEntryBytes": 500000,
+  "minArchiveBytes": 5000,
+  "showWidget": true,
+  "debug": false
 }
